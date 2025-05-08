@@ -1283,11 +1283,10 @@ app.delete('/admin/uebernahmen/:id', async (req, res) => {
 
 
 // Server starten
-const PORT = 5001;
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
-  console.log(`Node.js server started on http://10.130.156.144:${PORT}.`);
+  console.log(`Node.js server started on port ${PORT}.`);
 });
-
 
 
 
