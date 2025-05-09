@@ -453,7 +453,7 @@ app.get("/anfrage/all", async (req, res) => {
   }
 });
 
-
+// Route zum Bearbeiten einer Anfrage (Bestätigen oder Ablehnen)
 app.put("/anfrage/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -511,7 +511,7 @@ app.get("/api/DienstNotifications/:userId", async (req, res) => {
     const DienstNotifications = await DienstNotification.find({ userId })
       .sort({ createdAt: -1 })
       .limit(20); // nur die neuesten 20
-    res.status(200).send(DienstNotifications);
+    res.status(200).json(DienstNotifications);
   } catch (error) {
     res.status(500).send({ status: "error", message: "Fehler beim Laden" });
   }
