@@ -6,7 +6,18 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  userType: { type: String, required: true, enum: ["admin", "mitarbeiter"] }, // Neue Rolle
+  userType: { 
+    type: String, 
+    required: true, 
+    enum: ["admin", "mitarbeiter"] // Neue Rolle
+  },
+  pushToken: { 
+    type: String, 
+    default: null // Für Push-Benachrichtigungen
+  }
 });
 
-mongoose.model("UserInfo", userSchema);
+// Nur erstellen, wenn das Modell noch nicht existiert
+const UserInfo = mongoose.models.UserInfo || mongoose.model("UserInfo", userSchema);
+
+module.exports = UserInfo;

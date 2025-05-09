@@ -454,6 +454,25 @@ app.get("/anfrage/all", async (req, res) => {
 });
 
 // Route zum Bearbeiten einer Anfrage (Bestätigen oder Ablehnen)
+const sendPushNotification = async (pushToken, title, message) => {
+  const messageBody = {
+    to: pushToken,
+    sound: "default",
+    title,
+    body: message,
+    data: {},
+  };
+
+  await fetch("https://exp.host/--/api/v2/push/send ", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(messageBody),
+  });
+};
+
 app.put("/anfrage/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -477,20 +496,22 @@ app.put("/anfrage/:id", async (req, res) => {
       }
 
       await Dienstplan.create({ userId, datum, dienst: dienstTyp });
+    }
 
-      // ✅ DienstNotification hinzufügen bei Bestätigung
-      await DienstNotification.create({
-        userId,
-        title: "Tauschanfrage bestätigt",
-        message: `Dein Dienst am ${datum} (${dienstTyp}) wurde bestätigt.`,
-      });
-    } else if (status === "abgelehnt") {
-      // ✅ DienstNotification hinzufügen bei Ablehnung
-      await DienstNotification.create({
-        userId,
-        title: "Tauschanfrage abgelehnt",
-        message: `Deine Anfrage für ${datum} (${dienstTyp}) wurde abgelehnt.`,
-      });
+    // ✅ DienstNotification hinzufügen
+    const notification = await DienstNotification.create({
+      userId,
+      title: status === "bestätigt" ? "Dienstanfrage bestätigt" : "Dienstanfrage abgelehnt",
+      message:
+        status === "bestätigt"
+          ? `Dein Dienst am ${datum} (${dienstTyp}) wurde bestätigt.`
+          : `Deine Anfrage für den ${datum} (${dienstTyp}) wurde abgelehnt.`,
+    });
+
+    // 🔹 Nutzer mit Push-Token laden
+    const user = await User.findById(userId);
+    if (user?.pushToken) {
+      await sendPushNotification(user.pushToken, notification.title, notification.message);
     }
 
     // Anfrage löschen
@@ -508,15 +529,33 @@ app.put("/anfrage/:id", async (req, res) => {
 app.get("/api/DienstNotifications/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
-    const DienstNotifications = await DienstNotification.find({ userId })
+
+    // 🔍 Debug: Empfangene userId aus der URL
+    console.log("Empfangene userId:", userId);
+
+    if (!userId || userId.trim() === "") {
+      return res.status(400).json({
+        status: "error",
+        message: "userId ist erforderlich",
+      });
+    }
+
+    // 📦 Datenbankabfrage
+    const notifications = await DienstNotification.find({ userId })
       .sort({ createdAt: -1 })
-      .limit(20); // nur die neuesten 20
-    res.status(200).json(DienstNotifications);
+      .limit(20);
+
+    // 🔍 Debug: Anzahl der gefundenen Benachrichtigungen
+    console.log(`Gefundene Benachrichtigungen für ${userId}:`, notifications.length);
+
+    // ✅ Erfolgreiche Antwort
+    res.status(200).json(notifications);
   } catch (error) {
-    res.status(500).send({ status: "error", message: "Fehler beim Laden" });
+    // ❗ Fehlerbehandlung
+    console.error("Fehler beim Laden der Benachrichtigungen:", error.message);
+    res.status(500).json({ status: "error", message: "Fehler beim Laden" });
   }
 });
-
 
 
 
@@ -530,7 +569,19 @@ app.get("/anfrage/count", async (req, res) => {
   }
 });
 
+app.put("/api/users/:userId/push-token", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { pushToken } = req.body;
 
+    await User.findByIdAndUpdate(userId, { pushToken });
+
+    res.status(200).send({ status: "ok" });
+  } catch (error) {
+    console.error("Fehler beim Speichern des Push-Tokens:", error);
+    res.status(500).send({ status: "error", message: "Serverfehler" });
+  }
+});
 
 
 
