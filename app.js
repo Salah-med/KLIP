@@ -11,6 +11,10 @@ const Angebot = require('./Angebot');
 const DienstUebernahme = require('./models/DienstUebernahme');
 const AngenommeneTauschanfrage = require('./models/AngenommeneTauschanfrage');
 const IssueReport = require("./models/IssueReport");
+const DienstNotification = require("./Notifications/DienstNotification");
+
+
+
 const axios = require('axios');
 
 
@@ -449,36 +453,44 @@ app.get("/anfrage/all", async (req, res) => {
   }
 });
 
-// Route zum Aktualisieren des Status einer Anfrage
-// Route zum Aktualisieren des Status einer Anfrage und Löschen der Anfrage
+
 app.put("/anfrage/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
 
-    // Überprüfen, ob der Status gültig ist
     if (!["bestätigt", "abgelehnt"].includes(status)) {
       return res.status(400).send({ status: "error", message: "Ungültiger Status" });
     }
 
-    // Anfrage finden
     const anfrage = await Anfrage.findById(id);
     if (!anfrage) {
       return res.status(404).send({ status: "error", message: "Anfrage nicht gefunden" });
     }
 
-    // Wenn die Anfrage bestätigt wird, fügen Sie den Dienstplan hinzu
-    if (status === "bestätigt") {
-      const { userId, datum, dienstTyp } = anfrage;
+    const { userId, datum, dienstTyp } = anfrage;
 
-      // Überprüfen, ob der Dienstplan bereits existiert
+    if (status === "bestätigt") {
       const existingDienstplan = await Dienstplan.findOne({ userId, datum, dienst: dienstTyp });
       if (existingDienstplan) {
         return res.status(400).send({ status: "error", message: "Dieser Dienstplan-Eintrag existiert bereits." });
       }
 
-      // Neuen Dienstplan-Eintrag erstellen
       await Dienstplan.create({ userId, datum, dienst: dienstTyp });
+
+      // ✅ DienstNotification hinzufügen bei Bestätigung
+      await DienstNotification.create({
+        userId,
+        title: "Tauschanfrage bestätigt",
+        message: `Dein Dienst am ${datum} (${dienstTyp}) wurde bestätigt.`,
+      });
+    } else if (status === "abgelehnt") {
+      // ✅ DienstNotification hinzufügen bei Ablehnung
+      await DienstNotification.create({
+        userId,
+        title: "Tauschanfrage abgelehnt",
+        message: `Deine Anfrage für ${datum} (${dienstTyp}) wurde abgelehnt.`,
+      });
     }
 
     // Anfrage löschen
@@ -490,6 +502,21 @@ app.put("/anfrage/:id", async (req, res) => {
     res.status(500).send({ status: "error", message: "Serverfehler" });
   }
 });
+
+
+// Neue Route in deinem Backend
+app.get("/api/DienstNotifications/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const DienstNotifications = await DienstNotification.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(20); // nur die neuesten 20
+    res.status(200).send(DienstNotifications);
+  } catch (error) {
+    res.status(500).send({ status: "error", message: "Fehler beim Laden" });
+  }
+});
+
 
 
 
