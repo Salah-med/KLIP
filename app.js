@@ -16,6 +16,7 @@ const DienstNotification = require("./Notifications/DienstNotification");
 
 
 const axios = require('axios');
+const UserInfo = require("./UserDetails");
 
 
 
@@ -574,7 +575,7 @@ app.put("/api/users/:userId/push-token", async (req, res) => {
     const { userId } = req.params;
     const { pushToken } = req.body;
 
-    await User.findByIdAndUpdate(userId, { pushToken });
+    await UserInfo.findByIdAndUpdate(userId, { pushToken });
 
     res.status(200).send({ status: "ok" });
   } catch (error) {
