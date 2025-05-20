@@ -16,7 +16,7 @@ const WunschplanSchema = new mongoose.Schema({
     required: true 
   },
   WunschDatum: { 
-    type: String, 
+    type: Date,
     required: true 
   }, // Neuer gewünschter Tag
   WunschDienst: {

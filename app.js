@@ -12,11 +12,16 @@ const DienstUebernahme = require('./models/DienstUebernahme');
 const AngenommeneTauschanfrage = require('./models/AngenommeneTauschanfrage');
 const IssueReport = require("./models/IssueReport");
 const DienstNotification = require("./Notifications/DienstNotification");
+const AdminsDienstNotification = require("./Notifications/AdminsDienstNotification");
+const UserInfo = require("./UserDetails");
+const sendPushNotification = require("./sendPushNotification");
+
 
 
 
 const axios = require('axios');
-const UserInfo = require("./UserDetails");
+
+
 
 
 
@@ -76,6 +81,50 @@ app.post("/admin-add-user", async (req, res) => {
   }
 });
 
+// mehrer User erstellen 
+app.post("/admin-add-users-batch", async (req, res) => {
+  const users = req.body;
+
+  // Prüfen ob Array übergeben wurde
+  if (!Array.isArray(users)) {
+    return res.status(400).send({ status: "error", message: "Expected an array of users." });
+  }
+
+  const results = [];
+
+  for (const user of users) {
+    const { name, surname, username, email, password, userType } = user;
+
+    if (!email || !password) {
+      results.push({ email, status: "skipped", reason: "Missing email or password" });
+      continue;
+    }
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      results.push({ email, status: "skipped", reason: "User already exists" });
+      continue;
+    }
+
+    const encryptedPassword = await bcrypt.hash(password, 10);
+
+    try {
+      await User.create({
+        name,
+        surname,
+        username,
+        email,
+        password: encryptedPassword,
+        userType: userType || "mitarbeiter" // Default setzen
+      });
+      results.push({ email, status: "success" });
+    } catch (err) {
+      results.push({ email, status: "error", reason: err.message });
+    }
+  }
+
+  res.status(207).send({ status: "partial_success", results });
+});
 
 app.post("/change-password", async (req, res) => {
   const { oldPassword, newPassword } = req.body;
@@ -216,6 +265,8 @@ app.get("/api/get-wunschplan", async (req, res) => {
     const user = jwt.verify(token, JWT_SECRET);
     const userId = user.userId;
     const data = await Wunschplan.find({ userId });
+
+    // Keine Umwandlung mehr, MongoDB gibt Date-Objekt zurück
     return res.send({ status: "ok", data });
   } catch (error) {
     console.error(error);
@@ -312,43 +363,45 @@ app.get("/api/admin/wunschplaene", async (req, res) => {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).send({ status: "error", message: "Token nicht vorhanden oder ungültig" });
     }
+
     const token = authHeader.split(" ")[1];
     const user = jwt.verify(token, JWT_SECRET);
     const dbUser = await User.findOne({ email: user.email });
 
-    // Debugging-Ausgaben
-    console.log("Benutzer aus Token:", user);
-    console.log("Gefundener Benutzer in DB:", dbUser);
-
-    // Überprüfen, ob der Benutzer ein Admin ist
     if (!dbUser || dbUser.userType !== "admin") {
-      console.log("Admin-Prüfung fehlgeschlagen");
       return res.status(403).send({ status: "error", message: "Zugriff verweigert. Nur Admins dürfen diese Aktion ausführen." });
     }
 
-    // Alle Wunschpläne abrufen
-    const wunschplaene = await Wunschplan.find().populate("userId", "name surname email");
+    // 📅 Aktueller Monat
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 999);
 
-    // Transformiere die Daten, um sie dem neuen Schema anzupassen
-    const formattedWunschplaene = wunschplaene.map((w) => ({
-      _id: w._id,
-      userId: {
-        name: w.userId.name,
-        surname: w.userId.surname,
-        email: w.userId.email,
-      },
-      wishes: [
-        {
+    // Alle Mitarbeiter holen
+    const allUsers = await User.find({ userType: "mitarbeiter" }, "name surname email");
+
+    // Alle Wunschpläne des aktuellen Monats holen
+    const wunschplaene = await Wunschplan.find({
+      WunschDatum: { $gte: startOfMonth, $lte: endOfMonth }
+    }).populate("userId", "email");
+
+    // Jeder Mitarbeiter bekommt jetzt seine Wünsche zugeordnet
+    const result = allUsers.map(user => {
+      const userWishes = wunschplaene.filter(w => w.userId?.email === user.email);
+
+      return {
+        user,
+        wishes: userWishes.map(w => ({
           date: w.WunschDatum,
-          shifts: w.WunschDienst, // Mehrere Diensttypen als Array
-        },
-      ],
-    }));
+          shifts: w.WunschDienst,
+        })),
+      };
+    });
 
     res.status(200).send({
       status: "ok",
       message: "Wunschpläne erfolgreich abgerufen",
-      data: formattedWunschplaene,
+      data: result,
     });
   } catch (error) {
     console.error(error);
@@ -364,8 +417,7 @@ app.get("/api/admin/wunschplaene", async (req, res) => {
 
 
 
-
-// Route zum Senden von Anfragen bei aktulle Besetzung 
+// Route zum Senden von Anfragen bei aktuller Besetzung 
 app.post("/anfrage", async (req, res) => {
   try {
     const { userId, name, surname, datum, dienstTyp } = req.body;
@@ -390,6 +442,32 @@ app.post("/anfrage", async (req, res) => {
       dienstTyp,
       status: "pending",
     });
+
+
+    // 👇 Hier kommt die neue Logik zur Benachrichtigung aller Admins
+    const title = `${name} ${surname} hat eine Anfrage gestellt`;
+    const message = `${name} ${surname} hat eine Anfrage für "${dienstTyp}" am ${new Date(datum).toLocaleDateString()} erstellt.`;
+
+    // Alle Admins aus der Datenbank laden
+    const admins = await UserInfo.find({ userType: "admin" });
+
+    // Für jeden Admin:
+    // 1. Benachrichtigung in DB speichern
+    // 2. Push-Benachrichtigung senden (falls Token vorhanden)
+    for (const admin of admins) {
+      // 🔹 Speichere Benachrichtigung in der DB
+      await AdminsDienstNotification.create({
+        title,
+        message,
+        targetType: "admin",
+        senderId: userId
+      });
+
+      // 🔹 Sende Push-Benachrichtigung, falls Token vorhanden
+      if (admin.pushToken) {
+        await sendPushNotification(admin.pushToken, title, message);
+      }
+    }
 
     res.status(201).send({ status: "ok", message: "Anfrage erfolgreich gesendet", data: newAnfrage });
   } catch (error) {
@@ -454,25 +532,9 @@ app.get("/anfrage/all", async (req, res) => {
   }
 });
 
-// Route zum Bearbeiten einer Anfrage (Bestätigen oder Ablehnen)
-const sendPushNotification = async (pushToken, title, message) => {
-  const messageBody = {
-    to: pushToken,
-    sound: "default",
-    title,
-    body: message,
-    data: {},
-  };
 
-  await fetch("https://exp.host/--/api/v2/push/send ", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(messageBody),
-  });
-};
+
+// Route zum Bearbeiten einer Anfrage (Bestätigen oder Ablehnen)
 
 app.put("/anfrage/:id", async (req, res) => {
   try {
@@ -510,7 +572,7 @@ app.put("/anfrage/:id", async (req, res) => {
     });
 
     // 🔹 Nutzer mit Push-Token laden
-    const user = await User.findById(userId);
+    const user = await UserInfo.findById(userId);
     if (user?.pushToken) {
       await sendPushNotification(user.pushToken, notification.title, notification.message);
     }
@@ -560,6 +622,193 @@ app.get("/api/DienstNotifications/:userId", async (req, res) => {
 
 
 
+// DELETE /api/DienstNotifications/all?userId=...
+// Die spezifischere Route zuerst definieren
+app.delete("/api/DienstNotifications/deleteAll", async (req, res) => {
+  try {
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({
+        status: "error",
+        message: "userId ist erforderlich",
+      });
+    }
+
+    const result = await DienstNotification.deleteMany({ userId });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        status: "warning",
+        message: "Keine Benachrichtigungen gefunden zum Löschen",
+      });
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: `${result.deletedCount} Benachrichtigung(en) gelöscht`,
+    });
+  } catch (error) {
+    console.error("Fehler beim Löschen aller Benachrichtigungen:", error.message);
+    res.status(500).json({ status: "error", message: "Serverfehler" });
+  }
+});
+
+app.delete("/api/AdminsDienstNotifications/deleteAll", async (req, res) => {
+  try {
+    const result = await AdminsDienstNotification.deleteMany({ targetType: "admin" });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        status: "warning",
+        message: "Keine Admin-Benachrichtigungen gefunden zum Löschen",
+      });
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: `${result.deletedCount} Admin-Benachrichtigung(en) gelöscht`,
+    });
+  } catch (error) {
+    console.error("Fehler beim Löschen aller Admin-Benachrichtigungen:", error.message);
+    res.status(500).json({ status: "error", message: "Serverfehler" });
+  }
+});
+
+
+// Admins
+
+app.get("/api/AdminsDienstNotifications", async (req, res) => {
+  try {
+    const notifications = await AdminsDienstNotification.find({ targetType: "admin" })
+      .sort({ createdAt: -1 })
+      .limit(20);
+
+    res.status(200).json(notifications);
+  } catch (error) {
+    console.error("Fehler beim Laden der Benachrichtigungen:", error.message);
+    res.status(500).json({ status: "error", message: "Fehler beim Laden" });
+  }
+});
+
+
+
+
+app.get("/api/AdminsDienstNotifications/count", async (req, res) => {
+  try {
+    const count = await AdminsDienstNotification.countDocuments({ targetType: "admin" });
+
+    res.status(200).json({ count });
+  } catch (error) {
+    console.error("Fehler beim Zählen:", error.message);
+    res.status(500).json({ status: "error", message: "Fehler beim Zählen" });
+  }
+});
+
+app.delete("/api/AdminsDienstNotifications/:notificationId", async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+
+    if (!notificationId) {
+      return res.status(400).json({ status: "error", message: "notificationId erforderlich" });
+    }
+
+    const result = await AdminsDienstNotification.findByIdAndDelete(notificationId);
+
+    if (!result) {
+      return res.status(404).json({ status: "error", message: "Nicht gefunden" });
+    }
+
+    res.status(200).json({ status: "success", message: "Gelöscht" });
+  } catch (error) {
+    console.error("Fehler beim Löschen:", error.message);
+    res.status(500).json({ status: "error", message: "Löschen fehlgeschlagen" });
+  }
+});
+
+app.post("/api/AdminsDienstNotifications", async (req, res) => {
+  try {
+    const { title, message, senderId } = req.body;
+
+    const newNotification = new AdminsDienstNotification({
+      title,
+      message,
+      senderId,
+      targetType: "admin"
+    });
+
+    await newNotification.save();
+
+    res.status(201).json(newNotification);
+  } catch (error) {
+    console.error("Fehler beim Speichern:", error.message);
+    res.status(500).json({ status: "error", message: "Speichern fehlgeschlagen" });
+  }
+});
+
+
+
+
+
+//Mitarbieter 
+
+ app.get("/api/DienstNotifications/count/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    console.log("Empfangene userId für Count:", userId);
+
+    if (!userId || userId.trim() === "") {
+      return res.status(400).json({
+        status: "error",
+        message: "userId ist erforderlich",
+      });
+    }
+
+    // 🔢 Zähle ALLE Benachrichtigungen des Users
+    const count = await DienstNotification.countDocuments({ userId });
+
+    console.log(`Gesamtzahl der Benachrichtigungen: ${count}`);
+
+    res.status(200).json({ count });
+  } catch (error) {
+    console.error("Fehler beim Zählen der Benachrichtigungen:", error.message);
+    res.status(500).json({ status: "error", message: "Fehler beim Zählen" });
+  }
+});
+
+app.delete("/api/DienstNotifications/:notificationId", async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+
+    console.log("Lösche Benachrichtigung mit ID:", notificationId);
+
+    if (!notificationId) {
+      return res.status(400).json({
+        status: "error",
+        message: "notificationId ist erforderlich",
+      });
+    }
+
+    const result = await DienstNotification.findByIdAndDelete(notificationId);
+
+    if (!result) {
+      return res.status(404).json({
+        status: "error",
+        message: "Benachrichtigung nicht gefunden",
+      });
+    }
+
+    res.status(200).json({ status: "success", message: "Benachrichtigung gelöscht" });
+  } catch (error) {
+    console.error("Fehler beim Löschen der Benachrichtigung:", error.message);
+    res.status(500).json({ status: "error", message: "Fehler beim Löschen" });
+  }
+});
+
+
+
+
 app.get("/anfrage/count", async (req, res) => {
   try {
     const count = await Anfrage.countDocuments({ status: "pending" });
@@ -572,37 +821,42 @@ app.get("/anfrage/count", async (req, res) => {
 
 app.put("/api/users/:userId/push-token", async (req, res) => {
   try {
+    console.log("Endpoint /api/users/:userId/push-token wurde aufgerufen");
+
     const { userId } = req.params;
     const { pushToken } = req.body;
 
-    await UserInfo.findByIdAndUpdate(userId, { pushToken });
-
-    res.status(200).send({ status: "ok" });
-  } catch (error) {
-    console.error("Fehler beim Speichern des Push-Tokens:", error);
-    res.status(500).send({ status: "error", message: "Serverfehler" });
-  }
-});
-
-
-
-// Dienstplan erstellen (Admin-Route)
-app.post("/add-dienstplan", async (req, res) => {
-  const dienstplans = req.body; // Expecting this to be either an array or a single object
-  try {
-    // Check if the received body is an array
-    if (Array.isArray(dienstplans)) {
-      // Use insertMany to add multiple entries
-      const createdDienstplans = await Dienstplan.insertMany(dienstplans);
-      return res.status(201).send({ status: "ok", message: "Multiple Dienstplan entries added", data: createdDienstplans });
-    } else {
-      // Otherwise, we expect a single object
-      const { userId, datum, dienst } = dienstplans; // Destructure properties
-      await Dienstplan.create({ userId, datum, dienst });
-      return res.status(201).send({ status: "ok", message: "Dienstplan hinzugefügt" });
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ status: "error", message: "Ungültige userId" });
     }
+
+    if (!pushToken || typeof pushToken !== "string") {
+      return res.status(400).json({ status: "error", message: "Ungültiges Push-Token" });
+    }
+
+    const user = await UserInfo.findById(userId);
+    if (!user) {
+      return res.status(404).json({ status: "error", message: "Benutzer nicht gefunden." });
+    }
+
+    if (user.pushToken !== pushToken) {
+      user.pushToken = pushToken;
+      await UserInfo.updateOne(
+  { _id: userId },
+  { $set: { pushToken: pushToken } }
+);
+      console.log("✅ Push-Token erfolgreich gespeichert.");
+    } else {
+      console.log("ℹ️ Push-Token hat sich nicht geändert.");
+    }
+
+    
+
+    res.status(200).json({ status: "ok", pushToken });
+
   } catch (error) {
-    res.status(500).send({ status: "error", message: error.message });
+    console.error("🚨 Fehler beim Speichern des Push-Tokens:", error.message);
+    res.status(500).json({ status: "error", message: "Serverfehler" });
   }
 });
 
@@ -650,39 +904,25 @@ app.post('/tausch-anfrage', async (req, res) => {
 
   try {
     // 1. Prüfen, ob Benutzer an dem gewünschten neuen Tag selbst einen Dienst hat
-    const existingOwnShift = await Dienstplan.findOne({
-      userId,
-      datum: neuerTag, // <== Korrekte Feldbezeichnung
-    });
     
 
-    if (existingOwnShift) {
+    // 2. Doppelte Anfragen verhindern
+    const existingTarget = await TauschAnfrage.findOne({
+      userId,
+      originalDatum,
+      originalDienst,
+      neuerTag,
+      neuerDienst,
+    });
+
+    if (existingTarget) {
       return res.status(409).json({
         status: 'error',
-        message: 'Du hast an dem gewünschten Tauschdatum selbst einen Dienst.',
+        message: 'Für diese Kombination wurde bereits eine Tauschanfrage gestellt.',
       });
     }
 
-    // 2. Doppelte Anfragen für denselben Dienst an einem Tag verhindern
-// 2. Doppelte Anfragen für dieselbe exakte Kombination verhindern
-const existingTarget = await TauschAnfrage.findOne({
-  userId,
-  originalDatum,
-  originalDienst,
-  neuerTag,
-  neuerDienst,
-});
-
-if (existingTarget) {
-  return res.status(409).json({
-    status: 'error',
-    message: 'Für diese Kombination wurde bereits eine Tauschanfrage gestellt.',
-  });
-}
-
-
-
-    // 3. Anfrage speichern
+    // 3. Tauschanfrage speichern
     const neueAnfrage = await TauschAnfrage.create({
       userId,
       originalDatum,
@@ -691,19 +931,52 @@ if (existingTarget) {
       neuerDienst,
     });
 
+    // 🔍 Finde alle Benutzer, die am gewünschten Datum und Dienst arbeiten
+    const potentialMatches = await Dienstplan.find({
+      datum: neuerTag,
+      dienst: neuerDienst,
+    });
+
+    // Extrahiere userIds der passenden Benutzer
+    const potentialUserIds = potentialMatches.map(entry => entry.userId);
+
+    // Hole Benutzer mit Push-Token
+    const allUsersWithPushToken = await UserInfo.find({
+      _id: { $in: potentialUserIds },
+      pushToken: { $exists: true, $ne: null },
+      pushToken: /^ExponentPushToken/,
+    });
+
+    // 🔔 Für jeden gefundenen Benutzer eine Notification erstellen und senden
+    for (const empfänger of allUsersWithPushToken) {
+      const notification = await DienstNotification.create({
+        userId: empfänger._id,
+        title: `Neue Tauschanfrage`,
+        message: ` Tauschanfrage am ${originalDatum} (${originalDienst}) gegen deinen Dienst am ${neuerTag} (${neuerDienst}) .`,
+      });
+
+      if (empfänger.pushToken) {
+        await sendPushNotification(empfänger.pushToken, notification.title, notification.message);
+      }
+    }
+
     res.status(201).json({
       status: 'ok',
       message: 'Tauschanfrage gespeichert',
       data: neueAnfrage,
     });
+
   } catch (error) {
-    console.error(error);
+    console.error('Fehler bei der Tauschanfrage:', error);
     res.status(500).json({
       status: 'error',
-      message: 'Serverfehler',
+      message: 'Serverfehler beim Speichern der Tauschanfrage.',
     });
   }
 });
+
+
+
 
 app.delete('/dienstplan/:userId/:datum/:dienst', async (req, res) => {
   const { userId, datum, dienst } = req.params;
@@ -757,17 +1030,17 @@ app.post('/angebot', async (req, res) => {
       return res.status(400).json({ error: 'userId, datum und dienst sind erforderlich.' });
     }
 
-    // Benutzerdaten aus der Datenbank abrufen (z. B. Name und Nachname)
-    const user = await User.findById(userId); // Annahme: Es gibt ein User-Modell mit name und surname
+    // Benutzerdaten aus der Datenbank abrufen
+    const user = await User.findById(userId);
     if (!user) {
       return res.status(404).json({ error: 'Benutzer nicht gefunden.' });
     }
 
-    // Standardwerte für name und surname setzen, falls nicht angegeben
+    // Standardwerte setzen
     const finalName = name || user.name;
     const finalSurname = surname || user.surname;
 
-    // Neues Angebot erstellen
+    // Neues Angebot speichern
     const neuesAngebot = new Angebot({
       userId,
       name: finalName,
@@ -777,7 +1050,26 @@ app.post('/angebot', async (req, res) => {
     });
     await neuesAngebot.save();
 
+    // 🔔 Benachrichtigung NUR an Mitarbeiter senden
+    const allMitarbeiter = await UserInfo.find({
+      userType: "mitarbeiter",
+      pushToken: { $exists: true, $ne: null }
+    });
+
+    for (const empfänger of allMitarbeiter) {
+      const notification = await DienstNotification.create({
+        userId: empfänger._id,
+        title: `Neues Angebot verfügbar`,
+        message: `Dienst am ${datum} (${dienst}) ist jetzt im Angebot.`,
+      });
+
+      if (empfänger.pushToken && empfänger.pushToken.startsWith("ExponentPushToken")) {
+        await sendPushNotification(empfänger.pushToken, notification.title, notification.message);
+      }
+    }
+
     res.status(201).json({ message: 'Angebot erfolgreich erstellt.' });
+
   } catch (error) {
     console.error('Fehler beim Erstellen des Angebots:', error);
     res.status(500).json({ error: 'Interner Serverfehler.' });
@@ -813,44 +1105,193 @@ app.get('/get-dienstplan/:userId', async (req, res) => {
   }
 });
 
+
+// Backend-Route (z.B. in app.js oder einem Router)
+app.get('/dienst/for-date/:datum', async (req, res) => {
+  try {
+    const { datum } = req.params;
+
+    // Hole alle Dienste für das gegebene Datum
+    const dienste = await mongoose.model("Dienstplan").find({ datum }).populate('userId', 'name surname');
+
+    if (!dienste || dienste.length === 0) {
+      return res.json({ data: {} });
+    }
+
+    // Gruppiere nach Diensttyp und sammle Namen
+    const grouped = dienste.reduce((acc, entry) => {
+      if (!acc[entry.dienst]) {
+        acc[entry.dienst] = [];
+      }
+      acc[entry.dienst].push(`${entry.userId.name} ${entry.userId.surname}`);
+      return acc;
+    }, {});
+
+    res.json({ data: grouped });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
 // Dienst aktualisieren
 app.put('/update-dienstplan/:dienstplanId', async (req, res) => {
   try {
     const { dienst } = req.body;
+
+    // 🔍 Finde den alten Dienstplan-Eintrag vor der Änderung
+    const dienstplanEintrag = await Dienstplan.findById(req.params.dienstplanId);
+
+    if (!dienstplanEintrag) {
+      return res.status(404).json({ error: 'Dienstplan-Eintrag nicht gefunden.' });
+    }
+
+    const userId = dienstplanEintrag.userId;
+    const datum = dienstplanEintrag.datum;
+    const alterDienst = dienstplanEintrag.dienst;
+
+    // ✏️ Aktualisiere den Dienst
     await Dienstplan.findByIdAndUpdate(req.params.dienstplanId, { dienst });
+
+    // 📣 Optional: Nur senden, wenn sich etwas geändert hat
+    if (alterDienst !== dienst) {
+      // 🔔 Erstelle Notification
+      const notification = await DienstNotification.create({
+        userId,
+        title: 'Dienst geändert',
+        message: `Dein Dienst am ${datum} wurde geändert von "${alterDienst}" auf "${dienst}".`,
+      });
+
+      // 🔔 Hole Push-Token
+      const userInfo = await UserInfo.findOne({ _id: userId });
+
+      if (userInfo?.pushToken && userInfo.pushToken.startsWith("ExponentPushToken")) {
+        await sendPushNotification(userInfo.pushToken, notification.title, notification.message);
+      }
+    }
+
     res.json({ message: 'Dienst erfolgreich aktualisiert' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Serverfehler' });
+    console.error('Fehler beim Aktualisieren des Dienstplans:', error);
+    res.status(500).json({ error: 'Serverfehler beim Aktualisieren des Dienstplans' });
   }
 });
 
 // Dienst löschen
 app.delete('/delete-dienstplan/:dienstplanId', async (req, res) => {
   try {
-    await Dienstplan.findByIdAndDelete(req.params.dienstplanId);
-    res.json({ message: 'Dienst erfolgreich gelöscht' });
+    const dienstplanId = req.params.dienstplanId;
+
+    // 🔍 Dienst holen, bevor er gelöscht wird
+    const dienst = await Dienstplan.findById(dienstplanId);
+    if (!dienst) {
+      return res.status(404).json({ error: 'Dienst nicht gefunden' });
+    }
+
+    const { userId, datum, dienst: dienstName } = dienst;
+
+    // ✅ Dienst löschen
+    await Dienstplan.findByIdAndDelete(dienstplanId);
+
+    // 📣 Benutzerdaten laden für Name und Push-Token
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Benutzer nicht gefunden.' });
+    }
+
+    const fullName = `${user.name} ${user.surname}`;
+
+    // 🔔 Optional: Notification speichern
+    const notification = await DienstNotification.create({
+      userId,
+      title: 'Dienst gelöscht',
+      message: `Dein Dienst "${dienstName}" am ${datum} wurde aus dem Dienstplan entfernt.`,
+    });
+
+    // 🔔 Push-Token laden
+    const userInfo = await UserInfo.findOne({ _id: userId });
+
+    if (userInfo?.pushToken && userInfo.pushToken.startsWith("ExponentPushToken")) {
+      await sendPushNotification(userInfo.pushToken, notification.title, notification.message);
+    }
+
+    res.json({ message: 'Dienst erfolgreich gelöscht und Benutzer benachrichtigt' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Serverfehler' });
+    console.error('Fehler beim Löschen des Dienstplans:', error);
+    res.status(500).json({ error: 'Serverfehler beim Löschen des Dienstplans' });
   }
 });
 
 // Dienst erstellen (NEU)
+// Dienst erstellen (NEU)
 app.post('/create-dienstplan', async (req, res) => {
   try {
     const { userId, datum, dienst } = req.body;
+
+    // ✅ Neuen Dienst erstellen
     const neuerDienst = new Dienstplan({ userId, datum, dienst });
     await neuerDienst.save();
+
+    // 📣 Hole Benutzer für Name und Push-Token
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Benutzer nicht gefunden.' });
+    }
+
+    const fullName = `${user.name} ${user.surname}`;
+
+    // 🔔 Erstelle Notification
+    const notification = await DienstNotification.create({
+      userId,
+      title: 'Neuer Dienst ',
+      message: `Neuer Dienst "${dienst}" am ${datum} in deinem Dienstplaan.`,
+    });
+
+    // 🔔 Push-Token laden
+    const userInfo = await UserInfo.findOne({ _id: userId });
+
+    if (userInfo?.pushToken && userInfo.pushToken.startsWith("ExponentPushToken")) {
+      await sendPushNotification(userInfo.pushToken, notification.title, notification.message);
+    }
+
     res.json({ message: 'Dienst erfolgreich erstellt' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Serverfehler' });
+    console.error('Fehler beim Erstellen des Dienstplans:', error);
+    res.status(500).json({ error: 'Serverfehler beim Erstellen des Dienstplans' });
   }
 });
 
 
+app.post('/many-create-dienstplan', async (req, res) => {
+  try {
+    const diensteArray = req.body; // Erwartet: Array von Objekten mit userId, datum, dienst
 
+    if (!Array.isArray(diensteArray)) {
+      return res.status(400).json({ error: 'Es muss ein Array übergeben werden.' });
+    }
+
+    const erstellteDienste = [];
+
+    for (const { userId, datum, dienst } of diensteArray) {
+      // ✅ Neuen Dienst erstellen
+      const neuerDienst = new Dienstplan({ userId, datum, dienst });
+      await neuerDienst.save();
+      erstellteDienste.push(neuerDienst);
+
+     
+    }
+
+    res.json({ message: `${erstellteDienste.length} Dienste erfolgreich erstellt` });
+
+  } catch (error) {
+    console.error('Fehler beim Erstellen der Dienstpläne:', error);
+    res.status(500).json({ error: 'Serverfehler beim Erstellen der Dienstpläne' });
+  }
+});
 
 
 
@@ -1080,6 +1521,45 @@ app.post("/accept-tausch-anfrage", async (req, res) => {
       neuerDienst
     });
 
+
+    // ✅ Speichere als angenommene Tauschanfrage
+await AngenommeneTauschanfrage.create({
+  initiatorId: targetUserId,       // ursprünglicher Antragsteller
+  targetUserId: currentUserId,     // der es angenommen hat
+  originalDatum,
+  neuerTag,
+  originalDienst,
+  neuerDienst
+});
+
+
+// 📣 Benachrichtigung für den ursprünglichen Anfragenden (targetUserId)
+const currentUser = await User.findById(currentUserId); // Person, die angenommen hat
+const targetUser = await User.findById(targetUserId);   // Person, die die Anfrage gestellt hat
+
+if (!currentUser || !targetUser) {
+  return res.status(404).json({ status: "error", message: "Benutzer nicht gefunden" });
+}
+
+const fullName = `${currentUser.name} ${currentUser.surname}`;
+
+// 🔔 Erstelle Notification für targetUserId
+const notification = await DienstNotification.create({
+  userId: targetUserId,
+  title: 'Tauschanfrage angenommen',
+  message: `Deine Tauschanfrage wurde von ${fullName} angenommen.`,
+});
+
+// 🔔 Hole Push-Token des Empfängers
+const userInfo = await UserInfo.findOne({ _id: targetUserId });
+
+if (userInfo?.pushToken && userInfo.pushToken.startsWith("ExponentPushToken")) {
+  await sendPushNotification(userInfo.pushToken, notification.title, notification.message);
+}
+
+
+
+
     // Entferne Anfrage komplett
     // Entferne Anfrage komplett
 await TauschAnfrage.findByIdAndDelete(anfrageId);
@@ -1092,12 +1572,50 @@ await TauschAnfrage.deleteMany({
   _id: { $ne: anfrageId }, // die bereits angenommene Anfrage ausschließen
 });
 
+// 👇 Benachrichtige alle Admins über die erfolgreiche Tauschannahme
+const initiator = await User.findById(targetUserId);
+const accepter = await User.findById(currentUserId);
 
-    return res.status(200).send({
-      status: "ok",
-      message: "Tauschanfrage erfolgreich angenommen und dokumentiert.",
-      data: [dienst1, dienst2]
-    });
+if (!initiator || !accepter) {
+  return res.status(404).json({ status: "error", message: "Benutzer nicht gefunden" });
+}
+
+const title = "Tauschanfrage erfolgreich angenommen";
+const message = `${initiator.name} ${initiator.surname} hat erfolgreich mit ${accepter.name} ${accepter.surname} getauscht.`;
+
+// Alle Admins laden
+const admins = await UserInfo.find({ userType: "admin" });
+
+for (const admin of admins) {
+  // 🔹 Speichere in AdminsDienstNotification Collection
+  await AdminsDienstNotification.create({
+    userId: admin._id,
+    title,
+    message,
+    targetType: "admin",
+    senderId: currentUserId, // optional: wer war am Tausch beteiligt
+    meta: {
+      type: "tausch",
+      tauschPartner1: initiator._id,
+      tauschPartner2: accepter._id,
+      datumOriginal: originalDatum,
+      datumNeu: neuerTag,
+      dienstOriginal: originalDienst,
+      dienstNeu: neuerDienst,
+    }
+  });
+
+  // 🔹 Sende Push-Benachrichtigung, falls Token vorhanden
+  if (admin.pushToken && admin.pushToken.startsWith("ExponentPushToken")) {
+    await sendPushNotification(admin.pushToken, title, message);
+  }
+}
+
+    return res.status(200).json({
+  status: "ok",
+  message: "Tauschanfrage erfolgreich angenommen und dokumentiert.",
+  data: [dienst1, dienst2]
+});
   } catch (error) {
     console.error("❌ Fehler beim Akzeptieren der Tauschanfrage:", error);
     return res.status(500).send({
@@ -1150,6 +1668,9 @@ app.delete('/admin/angemommene-tauschanfragen/:id', async (req, res) => {
     res.status(500).json({ message: 'Interner Serverfehler' });
   }
 });
+
+
+
 
 
 
@@ -1253,7 +1774,6 @@ app.post('/angebot/annehmen/:id', async (req, res) => {
       console.warn('User hat bereits einen Dienst am selben Tag:', datumDesAngebots);
       return res.status(409).json({
         error: 'User hat bereits einen Dienst an diesem Tag.',
-
       });
     }
 
@@ -1270,17 +1790,74 @@ app.post('/angebot/annehmen/:id', async (req, res) => {
     console.log('Neuer Dienstplan-Eintrag für den Annehmenden erstellt.');
 
     // ✅ Speichere erfolgreiche Übernahme
-    await DienstUebernahme.create({
-      anbietenderUserId: anbietenderUserIdObj,
-      annehmenderUserId: annehmenderUserIdObj,
-      datum: datumDesAngebots,
-      dienst: angebot.dienst,
+await DienstUebernahme.create({
+  anbietenderUserId: anbietenderUserIdObj,
+  annehmenderUserId: annehmenderUserIdObj,
+  datum: datumDesAngebots,
+  dienst: angebot.dienst,
+});
+
+// 👇 Benachrichtige alle Admins über die erfolgreiche Dienstübernahme
+const anbietenderUser = await User.findById(anbietenderUserIdObj);
+const annehmenderUserForAdmin = await User.findById(annehmenderUserIdObj);
+
+if (!anbietenderUser || !annehmenderUserForAdmin) {
+  console.warn('Ein oder mehrere Benutzer nicht gefunden für Admin-Benachrichtigung.');
+} else {
+  const title = "Dienstübernahme erfolgreich";
+  const message = `${annehmenderUserForAdmin.name} ${annehmenderUserForAdmin.surname} hat den Dienst „${angebot.dienst}“ am ${new Date(datumDesAngebots).toLocaleDateString()} von ${anbietenderUser.name} ${anbietenderUser.surname} übernommen.`;
+
+  const admins = await UserInfo.find({ userType: "admin" });
+
+  for (const admin of admins) {
+    await AdminsDienstNotification.create({
+      userId: admin._id,
+      title,
+      message,
+      targetType: "admin",
+      senderId: annehmenderUserIdObj,
+      meta: {
+        type: "uebernahme",
+        anbietenderUserId: anbietenderUserIdObj,
+        annehmenderUserId: annehmenderUserIdObj,
+        datum: datumDesAngebots,
+        dienst: angebot.dienst
+      }
     });
+
+    if (admin.pushToken && admin.pushToken.startsWith("ExponentPushToken")) {
+      await sendPushNotification(admin.pushToken, title, message);
+    }
+  }
+
+  console.log('Admins wurden über die erfolgreiche Dienstübernahme benachrichtigt.');
+}
     console.log('Dienstübernahme protokolliert.');
 
     // ✅ Lösche das Angebot
     await Angebot.findByIdAndDelete(angebotId);
     console.log('Angebot erfolgreich gelöscht.');
+
+
+    // 📣 Zusatz: Benachrichtigung an Anbietenden
+    const annehmenderUser = await User.findById(annehmenderUserIdObj);
+    if (!annehmenderUser) {
+      console.warn('Annehmender Benutzer nicht gefunden:', annehmenderUserIdObj);
+    } else {
+      const fullName = `${annehmenderUser.name} ${annehmenderUser.surname}`;
+
+      const notification = await DienstNotification.create({
+        userId: anbietenderUserIdObj,
+        title: 'Angebot angenommen',
+        message: `Dein Angebot am ${datumDesAngebots} wurde von ${fullName} angenommen.`,
+      });
+
+      const userInfo = await UserInfo.findOne({ _id: anbietenderUserIdObj });
+      if (userInfo?.pushToken && userInfo.pushToken.startsWith("ExponentPushToken")) {
+        await sendPushNotification(userInfo.pushToken, notification.title, notification.message);
+      }
+    }
+
 
     // ✅ Erfolgsmeldung
     res.status(200).json({ message: 'Dienst erfolgreich übernommen und übertragen.' });
@@ -1361,14 +1938,15 @@ app.delete('/admin/uebernahmen/:id', async (req, res) => {
 
 
 
+
+
 // Server starten
+
+
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
-  console.log(`Node.js server started on port ${PORT}.`);
+  console.log(`Server running on port ${PORT}`);
 });
-
-
-
 
 
 
